@@ -6,6 +6,8 @@ use App\Helpers\VatsimRating;
 use App\Models\Booking;
 use App\Models\Endorsement;
 use App\Models\Position;
+use App\Models\Rating;
+use App\Models\Training;
 use App\Models\User;
 use Carbon\Carbon;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -16,17 +18,15 @@ class BookingTest extends TestCase
 {
     use RefreshDatabase, WithFaker;
 
-    private function assertCreateBookingAvailable(User $controller)
+    private function assertCreateBookingAvailable(User $controller, Position $position)
     {
-        $checkBrowser = $this->actingAs($controller)->followingRedirects()
-            ->get(route('booking'));
-
-        $randomPosition = Position::whereRating($controller->rating)->whereNotNull('name')->inRandomOrder()->first();
-        $checkBrowser->assertSee($randomPosition->name);
-        $checkBrowser->assertSeeText('Create Booking');
+        $this->actingAs($controller)->followingRedirects()
+            ->get(route('booking'))
+            ->assertSee($position->name)
+            ->assertSeeText('Create Booking');
     }
 
-    private function createBooking(User $controller)
+    private function createBooking(User $controller, Position $position)
     {
         $lastBooking = Booking::all()->last();
 
@@ -36,13 +36,14 @@ class BookingTest extends TestCase
             'date' => $startDate->format('d/m/Y'),
             'start_at' => $startDate->format('H:i'),
             'end_at' => $endDate->format('H:i'),
-            'position' => Position::whereRating($controller->rating)->whereNotNull('name')->inRandomOrder()->first()->callsign,
+            'position' => $position->callsign,
         ];
         $response = $this->actingAs($controller)->followingRedirects()->post(
             '/booking/store',
             $bookingRequest
         );
 
+        $response->assertSuccessful();
         $this->assertNotSame($lastBooking, Booking::all()->last());
 
         return $response;
@@ -69,12 +70,34 @@ class BookingTest extends TestCase
         ]);
 
         $setup($controller);
-        $this->assertCreateBookingAvailable($controller);
-        $this->createBooking($controller)->assertValid();
+        $highestTraining = Training::with('ratings')->where('status', 2)->whereBelongsTo($controller)->get()->sortByDesc('vatsim_rating')->first();
+
+        // If there's training available, let's try to create a booking for the training
+        if ($highestTraining) {
+            $rating = $highestTraining->getHighestVatsimRating()->vatsim_rating;
+            $position = Position::with('area')->where('rating', '<=', $rating)
+                ->whereBelongsTo($controller->atcActivity->first()->area)
+                ->whereNotNull('name')->orderByDesc('rating')->first();
+            $this->assertGreaterThan($controller->rating, $rating);
+            $this->assertCreateBookingAvailable($controller, $position);
+            $this->createBooking($controller, $position)->assertValid()->assertSeeText('training tag');
+        }
+
+        $rating = $controller->rating;
+        // Select a high position given the status we have
+        $position = Position::with('area')->where('rating', '<=', $rating)
+            ->whereBelongsTo($controller->atcActivity->first()->area)
+            ->whereNotNull('name')->inRandomOrder()->orderByDesc('rating')->first();
+        $this->assertCreateBookingAvailable($controller, $position);
+        $this->createBooking($controller, $position)->assertValid()->assertDontSeeText('training tag');
     }
 
     /**
      * Provides a list of controllers to feed to the booking test.
+     *
+     * TODO: These should use a repository or another factory, 'cause it's painful to use training directly.
+     * TODO: Use enums to make this more maintainable rather than use ints directly.
+     * TODO: Consider using $training->ratings()->saveMany() instead of factory.
      */
     public static function controllerProvider(): array
     {
@@ -87,9 +110,25 @@ class BookingTest extends TestCase
                     );
                 },
             ],
+            'S1 training for S2' => [
+                VatsimRating::S1,
+                function ($user) {
+                    Training::factory()
+                        ->has(Rating::factory(['vatsim_rating' => VatsimRating::S2]))
+                        ->create(['user_id' => $user->id, 'type' => 1, 'status' => 2]);
+                },
+            ],
             'S2 Rating' => [
                 VatsimRating::S2,
                 function () {
+                },
+            ],
+            'S2 Rating training for S3' => [
+                VatsimRating::S2,
+                function ($user) {
+                    Training::factory()
+                        ->has(Rating::factory(['vatsim_rating' => VatsimRating::S3]))
+                        ->create(['user_id' => $user->id, 'type' => 1, 'status' => 2]);
                 },
             ],
             'S3 Rating' => [
@@ -97,11 +136,76 @@ class BookingTest extends TestCase
                 function () {
                 },
             ],
+            'S3 Rating training for C1' => [
+                VatsimRating::S3,
+                function ($user) {
+                    Training::factory()
+                        ->has(Rating::factory(['vatsim_rating' => VatsimRating::C1]))
+                        ->create(['user_id' => $user->id, 'type' => 1, 'status' => 2]);
+                },
+            ],
             'C1 Rating' => [
                 VatsimRating::C1,
                 function () {
                 },
             ],
+            'C3 Rating' => [
+                VatsimRating::C3,
+                function () {
+                },
+            ],
+            'I1 Rating' => [
+                VatsimRating::I1,
+                function () {
+                },
+            ],
+            'I3 Rating' => [
+                VatsimRating::I3,
+                function () {
+                },
+            ],
         ];
+    }
+
+    /**
+     * Validate that a booking cannot be created with the same start and end date.
+     */
+    public function test_cannot_create_booking_with_same_start_and_end_time()
+    {
+        $controller = User::factory()->create([
+            'id' => fake()->numberBetween(100),
+            'rating' => VatsimRating::C1->value,
+        ]);
+
+        $controller->atcActivity()->create([
+            'user_id' => $controller->id,
+            'area_id' => 1,
+            'hours' => 100,
+            'atc_active' => true,
+        ]);
+
+        $startDate = new Carbon(fake()->dateTimeBetween('tomorrow', '+2 months'));
+
+        $bookingRequest = [
+            'date' => $startDate->format('d/m/Y'),
+            'start_at' => $startDate->format('H:i'),
+            'end_at' => $startDate->format('H:i'),
+            'position' => Position::where('rating', '<=', $controller->rating)
+                ->whereBelongsTo($controller->atcActivity->first()->area)
+                ->whereNotNull('name')
+                ->inRandomOrder()
+                ->orderByDesc('rating')
+                ->first()
+                ->callsign,
+        ];
+
+        $response = $this->actingAs($controller)->followingRedirects()->post(
+            '/booking/store',
+            $bookingRequest
+        );
+
+        error_log($response);
+        $response->assertInvalid();
+        $response->assertSessionHasErrors('end_at');
     }
 }
